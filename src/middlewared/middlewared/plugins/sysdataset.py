@@ -61,6 +61,13 @@ class SystemDatasetService(ConfigService):
     @private
     async def config_extend(self, config):
 
+        def sysdataset_exists_and_mounted():
+            p = Path(SYSDATASET_PATH)
+            if not p.exists() or not p.is_mount():
+                return False
+
+            return True
+
         # Treat empty system dataset pool as boot pool
         config['pool_set'] = bool(config['pool'])
         config['pool'] = self.force_pool or config['pool'] or await self.middleware.call('boot.pool_name')
@@ -89,7 +96,7 @@ class SystemDatasetService(ConfigService):
 
         config['syslog'] = config.pop('syslog_usedataset')
 
-        if not os.path.exists(SYSDATASET_PATH) or not os.path.ismount(SYSDATASET_PATH):
+        if not await self.middleware.run_in_thread(sysdataset_exists_and_mounted):
             config['path'] = None
         else:
             config['path'] = SYSDATASET_PATH
@@ -260,9 +267,47 @@ class SystemDatasetService(ConfigService):
                 f'Need {format_size(used)}'
             )
 
+    @private
+    def setup_core_path(self, corepath):
+        cores = Path(corepath)
+        if not cores.exists():
+            return
+
+        cores.chmod(0o775)
+
+        if self.middleware.call_sync('keyvalue.get', 'run_migration', False):
+            try:
+                for corefile in cores.iterdir():
+                    corefile.unlink()
+            except Exception:
+                self.logger.warning("Failed to clear old core files.", exc_info=True)
+
+        subprocess.run(['umount', '/var/lib/systemd/coredump'], check=False)
+        os.makedirs('/var/lib/systemd/coredump', exist_ok=True)
+        subprocess.run(['mount', '--bind', corepath, '/var/lib/systemd/coredump'])
+
     @accepts(Str('exclude_pool', default=None, null=True))
     @private
     async def setup(self, exclude_pool):
+        def get_mounted_pool():
+            for p in psutil.disk_partitions():
+                if not p.mountpoint == SYSDATASET_PATH:
+                    continue
+
+                return p.device.split('/')[0]
+
+            return None
+
+        def setup_sysdataset_path():
+            p = Path(SYSDATASET_PATH)
+            if p.is_dir():
+                return
+
+            if p.exists():
+                p.unlink()
+
+            os.makedirs(SYSDATASET_PATH)
+
         self.force_pool = None
         config = await self.config()
 
@@ -303,9 +348,8 @@ class SystemDatasetService(ConfigService):
                 config = await self.config()
 
         mounted_pool = mounted = None
-        for p in psutil.disk_partitions():
-            if p.mountpoint == SYSDATASET_PATH:
-                mounted_pool = p.device.split('/')[0]
+        mounted_pool = await self.middleware.run_in_thread(get_mounted_pool)
+
         if mounted_pool and mounted_pool != config['pool']:
             self.logger.debug('Abandoning dataset on %r in favor of %r', mounted_pool, config['pool'])
             async with self._release_system_dataset():
@@ -315,10 +359,7 @@ class SystemDatasetService(ConfigService):
         else:
             await self.__setup_datasets(config['pool'], config['uuid'])
 
-        if not os.path.isdir(SYSDATASET_PATH):
-            if os.path.exists(SYSDATASET_PATH):
-                os.unlink(SYSDATASET_PATH)
-            os.makedirs(SYSDATASET_PATH)
+        await self.middleware.run_in_thread(setup_sysdataset_path)
 
         acltype = await self.middleware.call('zfs.dataset.query', [('id', '=', config['basename'])])
         if acltype and acltype[0]['properties']['acltype']['value'] != 'off':
@@ -329,21 +370,7 @@ class SystemDatasetService(ConfigService):
         if mounted is None:
             mounted = await self.__mount(config['pool'], config['uuid'])
 
-        corepath = f'{SYSDATASET_PATH}/cores'
-        if os.path.exists(corepath):
-            os.chmod(corepath, 0o775)
-
-            if await self.middleware.call('keyvalue.get', 'run_migration', False):
-                try:
-                    cores = Path(corepath)
-                    for corefile in cores.iterdir():
-                        corefile.unlink()
-                except Exception:
-                    self.logger.warning("Failed to clear old core files.", exc_info=True)
-
-            await run('umount', '/var/lib/systemd/coredump', check=False)
-            os.makedirs('/var/lib/systemd/coredump', exist_ok=True)
-            await run('mount', '--bind', corepath, '/var/lib/systemd/coredump')
+        await self.middleware.run_in_thread(self.setup_core_path, f'{SYSDATASET_PATH}/cores')
 
         await self.middleware.call('etc.generate', 'glusterd')
 
@@ -409,16 +436,26 @@ class SystemDatasetService(ConfigService):
                     )
 
     async def __mount(self, pool, uuid, path=SYSDATASET_PATH):
+        def is_mounted(mp):
+            p = Path(mp)
+            if p.is_mount():
+                return True
+
+            if not p.is_dir():
+                p.mkdir()
+
+            return False
+
         mounted = False
         for dataset, name in self.__get_datasets(pool, uuid):
             if name:
                 mountpoint = f'{path}/{name}'
             else:
                 mountpoint = path
-            if os.path.ismount(mountpoint):
+
+            if await self.middleware.run_in_thread(is_mounted, mountpoint):
                 continue
-            if not os.path.isdir(mountpoint):
-                os.mkdir(mountpoint)
+
             await run('mount', '-t', 'zfs', dataset, mountpoint, check=True)
             mounted = True
 
@@ -436,6 +473,13 @@ class SystemDatasetService(ConfigService):
         return mounted
 
     async def __umount(self, pool, uuid):
+        def get_mp(dataset):
+            for partition in psutil.disk_partitions():
+                if partition.device == dataset:
+                    return partition.mountpoint
+
+            return None
+
         await run('umount', '/var/lib/systemd/coredump', check=False)
 
         flags = '-f' if not await self.middleware.call('failover.licensed') else '-l'
@@ -450,11 +494,7 @@ class SystemDatasetService(ConfigService):
 
                 error = f'Unable to umount {dataset}: {stderr}'
                 if 'target is busy' in stderr:
-                    mountpoint = None
-                    for partition in psutil.disk_partitions():
-                        if partition.device == dataset:
-                            mountpoint = partition.mountpoint
-                            break
+                    mountpoint = await self.middleware.run_in_thread('get_mp', dataset)
 
                     if mountpoint is not None:
                         error += f'\nThe following processes are using {mountpoint!r}: ' + json.dumps(
@@ -504,7 +544,7 @@ class SystemDatasetService(ConfigService):
                     proc = await Popen(f'zfs list -H -o name {_from}/.system|xargs zfs destroy -r', shell=True)
                     await proc.communicate()
 
-                    os.rmdir('/tmp/system.new')
+                    await self.middleware.run_in_thread(os.rmdir, '/tmp/system.new')
                 else:
                     raise CallError(f'Failed to rsync from {SYSDATASET_PATH}: {cp.stderr.decode()}')
 
@@ -569,19 +609,26 @@ async def pool_pre_export(middleware, pool, options, job):
 
 
 async def setup(middleware):
+    def make_nscd_paths():
+        p = Path('/var/cache/nscd')
+        if p.exists() and p.is_symlink():
+            return
+
+        if p.exists():
+            shutil.rmtree('/var/cache/nscd')
+
+        os.makedirs('/tmp/cache/nscd', exist_ok=True)
+        if not p.is_symlink('/var/cache/nscd'):
+            os.symlink('/tmp/cache/nscd', '/var/cache/nscd')
+
+        return
+
     middleware.register_hook('pool.post_create', pool_post_create)
     # Reconfigure system dataset first thing after we import a pool.
     middleware.register_hook('pool.post_import', pool_post_import, order=-10000)
     middleware.register_hook('pool.pre_export', pool_pre_export, order=40, raise_error=True)
 
     try:
-        if not os.path.exists('/var/cache/nscd') or not os.path.islink('/var/cache/nscd'):
-            if os.path.exists('/var/cache/nscd'):
-                shutil.rmtree('/var/cache/nscd')
-
-            os.makedirs('/tmp/cache/nscd', exist_ok=True)
-
-            if not os.path.islink('/var/cache/nscd'):
-                os.symlink('/tmp/cache/nscd', '/var/cache/nscd')
+        await middleware.run_in_thread(make_nscd_paths)
     except Exception:
         middleware.logger.error('Error moving cache away from boot pool', exc_info=True)
