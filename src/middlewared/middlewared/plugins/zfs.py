@@ -7,6 +7,7 @@ from copy import deepcopy
 
 import libzfs
 
+from middlewared.plugins.zfs_.validation_utils import validate_snapshot_name
 from middlewared.schema import accepts, Any, Bool, Dict, Int, List, Str
 from middlewared.service import (
     CallError, CRUDService, ValidationErrors, filterable, job, private,
@@ -1145,6 +1146,7 @@ class ZFSSnapshot(CRUDService):
 
         verrors = ValidationErrors()
 
+        name = None
         if 'name' in data and 'naming_schema' in data:
             verrors.add('snapshot_create.naming_schema', 'You can\'t specify name and naming schema at the same time')
         elif 'name' in data:
@@ -1162,6 +1164,9 @@ class ZFSSnapshot(CRUDService):
             for k in ['vmware_sync', 'properties']:
                 if data[k]:
                     verrors.add(f'snapshot_create.{k}', 'This option is not supported when excluding datasets')
+
+        if name and not validate_snapshot_name(f'{dataset}@{name}'):
+            verrors.add('snapshot_create.name', 'Please specify a valid snapshot name')
 
         if verrors:
             raise verrors
