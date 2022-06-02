@@ -117,13 +117,13 @@ expect {
     send "B"
   }
 
-  "installation on sda succeeded!" {
+  "installation on vda succeeded!" {
     send_user "Bhyve installation finished\n"
     sleep 5
     exit 0
   }
 
-  "installation on sda failed." {
+  "installation on vda failed." {
     send_user "Bhyve installation failed\n"
     sleep 5
     exit 1
