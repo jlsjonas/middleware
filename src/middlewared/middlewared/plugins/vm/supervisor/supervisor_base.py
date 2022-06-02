@@ -246,6 +246,12 @@ class VMSupervisorBase(LibvirtConnectionMixin):
             # Command line args
             *self.commandline_xml(),
         ]
+        # Memory Ballooning - this will be memory which will always be allocated to the VM
+        # If not specified, this defaults to `memory`
+        if self.vm_data['min_memory']:
+            domain_children.append(
+                create_element('currentMemory', unit='M', attribute_dict={'text': str(self.vm_data['min_memory'])})
+            )
 
         if self.vm_data['pin_vcpus'] and self.vm_data['cpuset']:
             domain_children.append(self.cputune_xml())
